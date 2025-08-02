@@ -6,48 +6,97 @@ import pandas as pd
 # from pybit.unified_trading import HTTP  # pip install pybit
 import numpy as np
 from io import StringIO
+import threading
+import os
 
 # === SETUP ===
-xrp = "XRPUSDT"
+symbols = ["BTCUSD", "BNBUSD", "ETHUSD", "XRPUSD", "XAUUSD"]
 # balance = 50
 # leverage = 75
 # risk_pct = 0.3
-csv_path = "/mnt/chromeos/removable/SD Card/Linux-shared-files/crypto and currency pairs/BTCUSD_1m_Binance.csv"
 interval_minutes = 1440  # 1 day, can be 10080 (week), 43200 (month)
+balance = 1000
 
-def load_last_n_mb_csv(filepath, max_mb=5):
-    # Read header first (just first line
-    with open(filepath, 'r', encoding='utf-8') as f:
-        header = f.readline()
+def load_last_mb(symbol, filepath="/mnt/chromeos/removable/sd_card/1m dataframes", mb_size=6*3):
+    # Search for a file containing the symbol in its name
+    matching_files = [f for f in os.listdir(filepath) if symbol.lower() in f.lower()]
+    if not matching_files:
+        raise FileNotFoundError(f"No file containing '{symbol}' found in {filepath}")
+    
+    # Use the first matching file
+    fp = os.path.join(filepath, matching_files[0])
+    bytes_to_read = mb_size * 1024 * 1024
 
-    n_bytes = max_mb * 1024 * 1024
-    with open(filepath, 'rb') as f:
-        f.seek(0, 2)
-        filesize = f.tell()
-        seek_pos = max(filesize - n_bytes, 0)
-        f.seek(seek_pos)
-        chunk = f.read()
+    with open(fp, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        start = max(0, f.tell() - bytes_to_read)
+        f.seek(start)
+        data = f.read().decode("utf-8", errors="ignore")
 
-        # Find first newline after seek_pos to skip partial line
-        first_newline = chunk.find(b'\n')
-        if first_newline == -1:
-            chunk_start = 0
-        else:
-            chunk_start = first_newline + 1
+    lines = data.split("\n")[1:] if start else data.split("\n")
+    df = pd.read_csv(StringIO("\n".join([l for l in lines if l.strip()])), header=None)
+    # clean_lines = [l for l in lines if l.count(",") >= 11]  # crude validation for 12-column lines
+    # csv_string = "\n".join(clean_lines)
+    # df = pd.read_csv(StringIO(csv_string), header=None)
+    
+    df.columns = [
+        "Open time","Open","High","Low","Close","Volume","Close time",
+        "Quote asset vol","Trades","Taker buy base","Taker buy quote","Ignore"
+    ]
 
-        chunk_str = chunk[chunk_start:].decode('utf-8', errors='replace')
+    # Convert 'Open time' to datetime and set as index
+    df['Open time'] = pd.to_datetime(df['Open time'])
+    df.set_index('Open time', inplace=True)
 
-    # Combine header and chunk string (so we have header + last data)
-    combined_str = header + chunk_str
+    # Keep only OHLC columns
+    df = df[['Open', 'High', 'Low', 'Close']].copy()
 
-    df = pd.read_csv(StringIO(combined_str), header=0)
-    if not isinstance(df, pd.DataFrame):
-        raise ValueError("CSV chunk did not return a DataFrame. Got: ", type(df))
-    df.columns = ["Open time","Open","High","Low","Close","Volume","Close time","Quote asset volume","Number of trades","Taker buy base asset volume","Taker buy quote asset volume","Ignore"]
+    # df = df.resample('15min').agg({
+    #     'Open': 'first',
+    #     'High': 'max',
+    #     'Low': 'min',
+    #     'Close': 'last'
+    # }).dropna()
 
-    # print("Columns in df:", df.columns.tolist())
-    # print("First row of df:\n", df.head(1))
- 
+    return df
+
+def load_last_mb_xauusd(file_path="/mnt/chromeos/removable/sd_card/1m dataframes/XAUUSD_1m_data.csv", mb=2*3, delimiter=';', col_names=None):
+    file_size = os.path.getsize(file_path)
+    offset = max(file_size - mb * 1024 * 1024, 0)  # start position
+    
+    with open(file_path, 'rb') as f:
+        # Seek to approximately 20 MB before EOF
+        f.seek(offset)
+        
+        # Read to the end of file from that offset
+        data = f.read().decode(errors='ignore')
+        
+        # If not at start of file, discard partial first line (incomplete)
+        if offset > 0:
+            data = data.split('\n', 1)[-1]
+        
+    df = pd.read_csv(StringIO(data), delimiter=delimiter, header=None, engine='python')
+    
+    #if col_names:
+    df.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    
+    # Convert columns if needed, e.g.:
+    df["Date"] = pd.to_datetime(df["Date"], format="%Y.%m.%d %H:%M", errors='coerce')
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.set_index('Date', inplace=True)
+    df = df[['Open', 'High', 'Low', 'Close']].copy()
+
+    # df = df.resample('15min').agg({
+    #     'Open': 'first',
+    #     'High': 'max',
+    #     'Low': 'min',
+    #     'Close': 'last'
+    # }).dropna()
+    
+    df = df.dropna()
+    
     return df
 
 def EMA(series, period):
@@ -223,9 +272,15 @@ def Fractals(df: pd.DataFrame,
         (l.shift(w) < l)
     )
 
-    df['Fractal_High'] = high_mask.shift(-w).fillna(False).infer_objects().astype(bool)
-    df['Fractal_Low']  = low_mask.shift(-w).fillna(False).infer_objects().astype(bool)
+    # df['Fractal_High'] = high_mask.shift(-w).fillna(False).infer_objects(copy=False).astype(bool)
+    # df['Fractal_Low']  = low_mask.shift(-w).fillna(False).infer_objects(copy=False).astype(bool)
+    # df['Fractal_High'] = high_mask.shift(-w).astype('boolean').fillna(False).astype(bool)
+    # df['Fractal_Low']  = low_mask.shift(-w).astype('boolean').fillna(False).astype(bool)
+    df['Fractal_High'] = (df['High'] == df['High'].rolling(window=2*w+1, center=True).max())
+    df['Fractal_Low'] = (df['Low'] == df['Low'].rolling(window=2*w+1, center=True).min())
+    
     return df
+
 def add_indicators(df):
     df['EMA_7'] = df['Close'].ewm(span=7).mean()
     df['EMA_14'] = df['Close'].ewm(span=14).mean()
@@ -270,22 +325,22 @@ def add_indicators(df):
     df['ADX'], df['+DI'], df['-DI'] = ADX(df)
     df['Di_Diff'] = (df['+DI'] - df['-DI']).abs()
 
-    df['Bulls'] = BullsPower(df)     # High – EMA(close, 13)
-    df['Bears'] = BearsPower(df)     # Low  – EMA(close, 13)
+    # df['Bulls'] = BullsPower(df)     # High – EMA(close, 13)
+    # df['Bears'] = BearsPower(df)     # Low  – EMA(close, 13)
     # df['Bulls'] = df['High'] - df['Close']
     # df['Bears'] = df['Close'] - df['Low']
     # df['Bullish_DI'] = df['Bulls'] - df['Bears']
     # df['Bullish_DI'] = df['+DI'] - df['-DI']
     # df['Bearish_DI'] = df['-DI'] - df['+DI']
     # df['Bull_Bear_Diff'] = (df['Bulls'] - df['Bears']) / df['ATR']
-    df['Bull_Bear_Diff'] = (df['Bulls'] - df['Bears'])
+    # df['Bull_Bear_Diff'] = (df['Bulls'] - df['Bears'])
 
     df['OSMA'] = df['macd_line'] - df['macd_signal']
     df['OSMA_Diff'] = df['OSMA'].diff()
 
-    df = SAR(df)
+    # df = SAR(df)
 
-    df = Fractals(df)
+    # df = Fractals(df)
 
     # df[]
 
@@ -320,10 +375,10 @@ def generate_signals(df):
         latest = df.iloc[i]
 
         # -------------- flat‑market veto ------------------------------
-        window = df.iloc[i - 10 : i]
-        price_range = window["High"].max() - window["Low"].min()
-        if (price_range / window["Close"].mean()) <= 0.005:
-            continue
+        # window = df.iloc[i - 10 : i]
+        # price_range = window["High"].max() - window["Low"].min()
+        # if (price_range / window["Close"].mean()) <= 0.005:
+        #     continue
 
         # -------------- trend strength check --------------------------
         if latest.ADX < 20:
@@ -338,10 +393,10 @@ def generate_signals(df):
         if macd_hook.iloc[i]:
             continue
 
-       if df['macd_signal_cross_up']:
+        if df['macd_signal_cross_up'].iloc[i]:
            signals[i] = "Buy"
-        elif df['macd_signal_cross_down']:
-            ksignals[i] = "Sell"
+        elif df['macd_signal_cross_down'].iloc[i]:
+            signals[i] = "Sell"
 
         # -------------- directional logic -----------------------------
         # if latest.macd_signal_diff > 0:
@@ -369,18 +424,28 @@ def generate_signals(df):
     df["signal"] = signals
     return df["signal"]
 
+def calculate_position_size(balance, risk_pct, entry_price, stop_loss, leverage, min_qty=0.001):
+    risk_amount = max(balance * risk_pct, 50)
+    position_size = risk_amount / abs(entry_price - stop_loss) * leverage
+    # position_size = round(position_size, 3)
+
+    if position_size < min_qty:
+        position_size = min_qty
+
+    return position_size
+
 # ------------------------------------------------------------------
 # 1) position‑sizing + classic ATR‑fib TP levels
 # ------------------------------------------------------------------
 def calculate_trade_parameters(entry_price, atr, balance,
-                               side, leverage=20, risk_pct=0.10):
+                               side, leverage=50, risk_pct=0.05):
     """
     • Risk   : risk_pct of balance (margin) × leverage
     • SL     : 1.5 × ATR
     • TP     : 3 × ATR × Fibonacci([0.236,0.382,0.5,0.618])
     """
 
-    # fib_levels = [0.236, 0.382, 0.5, 0.618]
+    fib_levels = [0.382, 0.618, 0.786]
 
     # position size
     margin          = balance * risk_pct
@@ -388,24 +453,26 @@ def calculate_trade_parameters(entry_price, atr, balance,
     position_size   = position_value / entry_price
 
     # stop‑loss
-    # sl_dist  = 1.5 * atr
-    # stop_loss = (entry_price - sl_dist) if side.lower() == "buy" \
-    #             else (entry_price + sl_dist)
+    sl_dist  = 1.5 * atr
+    stop_loss = (entry_price - sl_dist) if side.lower() == "buy" \
+                else (entry_price + sl_dist)
+
+    # position_size = calculate_position_size(balance, 0.05, entry_price, stop_loss, 50)
 
     # take‑profits
-    # base = 3.0 * atr
-    # tp_levels = [ (entry_price + base * f)  if side.lower() == "buy"
-    #               else (entry_price - base * f)
-    #               for f in fib_levels ]
+    base = 4.5 * atr
+    tp_levels = [ (entry_price + base * f)  if side.lower() == "buy"
+                  else (entry_price - base * f)
+                  for f in fib_levels ]
 
     return {
-        "position_size": round(position_size, 4),
-        # "stop_loss"    : round(stop_loss, 6),
-        # "tp_levels"    : [round(tp, 6) for tp in tp_levels]
+        "position_size": round(position_size, 6),
+        "stop_loss"    : round(stop_loss, 6),
+        "tp_levels"    : [round(tp, 6) for tp in tp_levels]
     }
 
 # ------------------------------------------------------------------
-# 2) updater that supports 4 partial TP hits (40/20/20/20)
+# 2) updater that supports 3 partial TP hits (40/20/20)
 # ------------------------------------------------------------------
 def update_trade(trade, current_price, atr, df_latest):
     if trade["status"] != "open":
@@ -414,55 +481,60 @@ def update_trade(trade, current_price, atr, df_latest):
     qty        = trade["qty"]
     entry      = trade["entry"]
     side_buy   = trade["side"].lower() == "buy"
-    # sl         = trade["sl"]
-    # tp_levels  = trade["tp_levels"]
-    # tp_hits    = trade.get("tp_hits", [False, False, False, False])
+    sl         = trade["sl"]
+    tp_levels  = trade["tp_levels"]
+    tp_hits    = trade.get("tp_hits", [False, False, False])
     realized   = 0.0
 
     # ----- stop‑loss --------------------------------------------------
-    # if side_buy and current_price <= sl:
-    #     pnl = (sl - entry) * qty
-    #     trade["status"] = "closed"; trade["pnl"] += pnl
-    #     return trade, pnl
-    # elif (not side_buy) and current_price >= sl:
-    #     pnl = (entry - sl) * qty
-    #     trade["status"] = "closed"; trade["pnl"] += pnl
-    #     return trade, pnl
+    if side_buy and current_price <= sl:
+        pnl = (sl - entry) * qty
+        trade["status"] = "closed"; trade["pnl"] += pnl
+        return trade, pnl
+    elif (not side_buy) and current_price >= sl:
+        pnl = (entry - sl) * qty
+        trade["status"] = "closed"; trade["pnl"] += pnl
+        return trade, pnl
 
     # ----- partial TPs (40/20/20/20) ---------------------------------
-    # portions = [0.4, 0.2, 0.2, 0.2]
+    portions = [0.4, 0.2, 0.2, 20]
 
-    # for i, (tp, hit) in enumerate(zip(tp_levels, tp_hits)):
-    #     if hit:
-    #         continue
-    #     if (side_buy  and current_price >= tp) or \
-    #        ((not side_buy) and current_price <= tp):
-    #         part_qty = qty * portions[i]
-    #         pnl = (tp - entry) * part_qty if side_buy \
-    #               else (entry - tp) * part_qty
-    #         realized        += pnl
-    #         trade["pnl"]    += pnl
-    #         tp_hits[i]       = True
+    for i, (tp, hit) in enumerate(zip(tp_levels, tp_hits)):
+        if hit:
+            continue
+        if (side_buy  and current_price >= tp) or \
+           ((not side_buy) and current_price <= tp):
+            part_qty = qty * portions[i]
+            pnl = (tp - entry) * part_qty if side_buy \
+                  else (entry - tp) * part_qty
+            realized        += pnl
+            trade["pnl"]    += pnl
+            tp_hits[i]       = True
 
-    # trade["tp_hits"] = tp_hits
+    trade["tp_hits"] = tp_hits
 
     # close trade if all targets hit
-    # if all(tp_hits):
-    #     trade["status"] = "closed"
+    if all(tp_hits):
+        trade["status"] = "closed"
 
     return trade, realized
 
-def run_bot():
-    df = load_last_n_mb_csv(csv_path)
-    df['Open time'] = pd.to_datetime(df['Open time'])
-    df.set_index('Open time', inplace=True)
-    df = df.dropna()
+def run_bot(symbol):
+    global balance
+    df = None
+    if symbol == "XAUUSD":
+        df = load_last_mb_xauusd()
+    else:
+        df = load_last_mb(symbol)
+    # df['Open time'] = pd.to_datetime(df['Open time'])
+    # df.set_index('Open time', inplace=True)
+    # df = df.dropna()
     df = add_indicators(df)
     df['signal'] = generate_signals(df)
     # print(df.columns)
-    balance = 160
-    risk_pct = 0.1
-    leverage = 20
+    # balance = 1000
+    risk_pct = 0.05
+    leverage = 50
 
     trade_results = []
     total_trades = 0
@@ -482,7 +554,7 @@ def run_bot():
                 avg_profit = sum(wins) / len(wins) if wins else 0
                 avg_loss = sum(losses) / len(losses) if losses else 0
                 
-                print(f"Stats at day {((i + 1) / 1440):.0f}:")
+                print(f"[{symbol}] Stats at day {((i + 1) / 1440):.0f}:")
                 print(f"  Total trades: {total_trades}")
                 print(f"  Win rate: {win_rate:.2f}%")
                 print(f"  Avg profit: {avg_profit:.2f}")
@@ -499,19 +571,19 @@ def run_bot():
         atr = latest['ATR']
 
         # Update active trade if any
-        # if active_trade:
-        #     active_trade, pnl = update_trade(active_trade, current_price, atr, latest)
-        #     if pnl != 0:
-        #         # balance += pnl
-        #         balance += active_trade['pnl']
-        #         trade_results.append(pnl)
-        #         if active_trade["status"] == "closed":
-        #             active_trade["exit"] = current_price
-        #             total_trades += 1
-        #             # print(f"Trade {total_trades} | Side: {active_trade['side'].capitalize()} | Entry: {active_trade['entry']:.2f} | Exit: {active_trade['exit']:.2f} | Size: {active_trade['qty']:.4f} | PnL: {active_trade['pnl']:.2f} | Balance: {balance:.2f} | ATR: {atr}")
+        if active_trade:
+            active_trade, pnl = update_trade(active_trade, current_price, atr, latest)
+            if pnl != 0:
+                # balance += pnl
+                balance += active_trade['pnl']
+                trade_results.append(pnl)
+                if active_trade["status"] == "closed":
+                    active_trade["exit"] = current_price
+                    total_trades += 1
+                    # print(f"Trade {total_trades} | Side: {active_trade['side'].capitalize()} | Entry: {active_trade['entry']:.2f} | Exit: {active_trade['exit']:.2f} | Size: {active_trade['qty']:.4f} | PnL: {active_trade['pnl']:.2f} | Balance: {balance:.2f} | ATR: {atr}")
 
-        #             active_trade = None
-        #             num_active_trades -= 1
+                    active_trade = None
+                    num_active_trades -= 1
 
         # Get current signal and mode
         
@@ -525,7 +597,7 @@ def run_bot():
             active_trade["exit"] = current_price
 
             active_trade["exit"] = current_price
-            active_trade["pnl"] = (current_price - active_trade["entry"]) * active_trade["qty"] if active_trade["side"] == "buy" else (active_trade["entry"] - current_price) * active_trade["qty"]
+            active_trade["pnl"] = (current_price - active_trade["entry"]) * active_trade["qty"] - active_trade["qty"] * 0.00075 * 2 - active_trade["qty"] * 0.00025 if active_trade["side"] == "buy" else (active_trade["entry"] - current_price) * active_trade["qty"] - active_trade["qty"] * 0.00075 * 2 - active_trade["qty"] * 0.00025
             # print(f"Trade {total_trades} | Side: {active_trade['side'].capitalize()} | Entry: {active_trade['entry']:.2f} | Exit: {active_trade['exit']:.2f} | Size: {active_trade['qty']:.4f} | PnL: {active_trade['pnl']:.2f} | Balance: {balance:.2f} | ATR: {atr}")
             active_trade["side"] = signal
             balance += active_trade["pnl"]
@@ -548,14 +620,19 @@ def run_bot():
                 "side": signal,
                 "entry": entry_price,
                 "qty": trade_params["position_size"],
-                # "sl": trade_params["stop_loss"],
-                # "tp_levels": trade_params["tp_levels"],
-                # "tp_hits": [False, False, False, False],
-                # "trail_active": False,
-                # "trail_offset": atr * 1.5,
+                "sl": trade_params["stop_loss"],
+                "tp_levels": trade_params["tp_levels"],
+                "tp_hits": [False, False, False],
+                "trail_active": False,
+                "trail_offset": atr * 1.5,
                 "pnl": 0
             }
             num_active_trades += 1
 
-
-run_bot()
+test_threads = []
+for symbol in symbols:
+    t = threading.Thread(target=run_bot, args=(symbol,))
+    t.start()
+    test_threads.append(t)
+for t in test_threads:
+    t.join()
